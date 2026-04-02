@@ -281,6 +281,69 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let hadError = false;
   let outputSentToUser = false;
 
+  // React to the trigger message with 👀 to signal processing has started
+  const triggerMessage = [...missedMessages]
+    .reverse()
+    .find((m) => !m.is_from_me);
+  const triggerTs = triggerMessage?.id;
+  if (triggerTs) {
+    await channel.addReaction?.(chatJid, triggerTs, 'eyes').catch(() => {});
+  }
+
+  const progressMsgId = channel.updateMessage
+    ? `progress-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    : null;
+  const progressStartTime = Date.now();
+  let progressFrame = 0;
+  let progressTimer: ReturnType<typeof setInterval> | null = null;
+
+  const CLOCK_FRAMES = [
+    '🕐',
+    '🕑',
+    '🕒',
+    '🕓',
+    '🕔',
+    '🕕',
+    '🕖',
+    '🕗',
+    '🕘',
+    '🕙',
+    '🕚',
+    '🕛',
+  ];
+
+  const getProgressStage = (elapsedSec: number): string => {
+    if (elapsedSec < 15) return '💭 생각 중...';
+    if (elapsedSec < 45) return '🔍 분석 중...';
+    if (elapsedSec < 120) return '✍️  작성 중...';
+    return '⚙️  열심히 처리 중...';
+  };
+
+  const nowKST = () =>
+    new Intl.DateTimeFormat('ko-KR', {
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      timeZone: 'Asia/Seoul',
+    }).format(new Date());
+
+  if (progressMsgId) {
+    await channel.sendMessage(
+      chatJid,
+      `${CLOCK_FRAMES[0]} 💭 생각 중... (0초) | ${nowKST()}`,
+      progressMsgId,
+    );
+    progressTimer = setInterval(async () => {
+      progressFrame = (progressFrame + 1) % CLOCK_FRAMES.length;
+      const elapsed = Math.round((Date.now() - progressStartTime) / 1000);
+      await channel.updateMessage?.(
+        chatJid,
+        progressMsgId,
+        `${CLOCK_FRAMES[progressFrame]} ${getProgressStage(elapsed)} (${elapsed}초) | ${nowKST()}`,
+      );
+    }, 3000);
+  }
+
   const output = await runAgent(group, prompt, chatJid, async (result) => {
     // Streaming output callback — called for each agent result
     if (result.result) {
@@ -307,6 +370,26 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       hadError = true;
     }
   });
+
+  if (progressTimer) clearInterval(progressTimer);
+  if (progressMsgId) {
+    const elapsed = Math.round((Date.now() - progressStartTime) / 1000);
+    await channel.updateMessage?.(
+      chatJid,
+      progressMsgId,
+      hadError
+        ? `❌ 오류 발생 (${elapsed}초 소요) | ${nowKST()}`
+        : `✅ 완료! (${elapsed}초 소요) | ${nowKST()}`,
+    );
+  }
+
+  // Replace 👀 reaction with ✅ or ❌
+  if (triggerTs) {
+    await channel.removeReaction?.(chatJid, triggerTs, 'eyes').catch(() => {});
+    await channel
+      .addReaction?.(chatJid, triggerTs, hadError ? 'x' : 'white_check_mark')
+      .catch(() => {});
+  }
 
   await channel.setTyping?.(chatJid, false);
   if (idleTimer) clearTimeout(idleTimer);

@@ -37,6 +37,8 @@ export class SlackChannel implements Channel {
   private outgoingQueue: Array<{ jid: string; text: string }> = [];
   private flushing = false;
   private userNameCache = new Map<string, string>();
+  // Maps msgId (caller-assigned) -> Slack message ts
+  private msgIdToTs = new Map<string, string>();
 
   private opts: SlackChannelOpts;
 
@@ -94,11 +96,17 @@ export class SlackChannel implements Channel {
       const groups = this.opts.registeredGroups();
       if (!groups[jid]) return;
 
-      const isBotMessage =
-        !!msg.bot_id || msg.user === this.botUserId;
+      // isSelfMessage: 이 봇 자신이 보낸 메시지 (재트리거 방지)
+      // isAnyBotMessage: 모든 봇 메시지 (다른 봇 포함)
+      const isSelfMessage =
+        msg.user === this.botUserId ||
+        (!msg.user &&
+          !!msg.bot_id &&
+          !msg.text.includes(`<@${this.botUserId}>`));
+      const isAnyBotMessage = !!msg.bot_id || msg.user === this.botUserId;
 
       let senderName: string;
-      if (isBotMessage) {
+      if (isAnyBotMessage) {
         senderName = ASSISTANT_NAME;
       } else {
         senderName =
@@ -111,9 +119,12 @@ export class SlackChannel implements Channel {
       // Slack encodes @mentions as <@U12345>, which won't match TRIGGER_PATTERN
       // (e.g., ^@<ASSISTANT_NAME>\b), so we prepend the trigger when the bot is @mentioned.
       let content = msg.text;
-      if (this.botUserId && !isBotMessage) {
+      if (this.botUserId && !isSelfMessage) {
         const mentionPattern = `<@${this.botUserId}>`;
-        if (content.includes(mentionPattern) && !TRIGGER_PATTERN.test(content)) {
+        if (
+          content.includes(mentionPattern) &&
+          !TRIGGER_PATTERN.test(content)
+        ) {
           content = `@${ASSISTANT_NAME} ${content}`;
         }
       }
@@ -125,8 +136,8 @@ export class SlackChannel implements Channel {
         sender_name: senderName,
         content,
         timestamp,
-        is_from_me: isBotMessage,
-        is_bot_message: isBotMessage,
+        is_from_me: isSelfMessage, // 자기 자신만 true
+        is_bot_message: isAnyBotMessage, // 모든 봇은 true
       });
     });
   }
@@ -142,10 +153,7 @@ export class SlackChannel implements Channel {
       this.botUserId = auth.user_id as string;
       logger.info({ botUserId: this.botUserId }, 'Connected to Slack');
     } catch (err) {
-      logger.warn(
-        { err },
-        'Connected to Slack but failed to get bot user ID',
-      );
+      logger.warn({ err }, 'Connected to Slack but failed to get bot user ID');
     }
 
     this.connected = true;
@@ -157,7 +165,7 @@ export class SlackChannel implements Channel {
     await this.syncChannelMetadata();
   }
 
-  async sendMessage(jid: string, text: string): Promise<void> {
+  async sendMessage(jid: string, text: string, msgId?: string): Promise<void> {
     const channelId = jid.replace(/^slack:/, '');
 
     if (!this.connected) {
@@ -172,13 +180,23 @@ export class SlackChannel implements Channel {
     try {
       // Slack limits messages to ~4000 characters; split if needed
       if (text.length <= MAX_MESSAGE_LENGTH) {
-        await this.app.client.chat.postMessage({ channel: channelId, text });
+        const result = await this.app.client.chat.postMessage({
+          channel: channelId,
+          text,
+        });
+        if (msgId && result.ts) {
+          this.msgIdToTs.set(msgId, result.ts as string);
+        }
       } else {
         for (let i = 0; i < text.length; i += MAX_MESSAGE_LENGTH) {
-          await this.app.client.chat.postMessage({
+          const result = await this.app.client.chat.postMessage({
             channel: channelId,
             text: text.slice(i, i + MAX_MESSAGE_LENGTH),
           });
+          // Track msgId only for the first chunk
+          if (msgId && i === 0 && result.ts) {
+            this.msgIdToTs.set(msgId, result.ts as string);
+          }
         }
       }
       logger.info({ jid, length: text.length }, 'Slack message sent');
@@ -188,6 +206,51 @@ export class SlackChannel implements Channel {
         { jid, err, queueSize: this.outgoingQueue.length },
         'Failed to send Slack message, queued',
       );
+    }
+  }
+
+  async updateMessage(jid: string, msgId: string, text: string): Promise<void> {
+    const channelId = jid.replace(/^slack:/, '');
+    const ts = this.msgIdToTs.get(msgId);
+    if (!ts) return;
+    try {
+      await this.app.client.chat.update({ channel: channelId, ts, text });
+    } catch (err) {
+      logger.debug({ jid, msgId, err }, 'Failed to update Slack message');
+    }
+  }
+
+  async addReaction(
+    jid: string,
+    messageTs: string,
+    emoji: string,
+  ): Promise<void> {
+    const channelId = jid.replace(/^slack:/, '');
+    try {
+      await this.app.client.reactions.add({
+        channel: channelId,
+        name: emoji,
+        timestamp: messageTs,
+      });
+    } catch (err) {
+      logger.debug({ jid, messageTs, emoji, err }, 'Failed to add reaction');
+    }
+  }
+
+  async removeReaction(
+    jid: string,
+    messageTs: string,
+    emoji: string,
+  ): Promise<void> {
+    const channelId = jid.replace(/^slack:/, '');
+    try {
+      await this.app.client.reactions.remove({
+        channel: channelId,
+        name: emoji,
+        timestamp: messageTs,
+      });
+    } catch (err) {
+      logger.debug({ jid, messageTs, emoji, err }, 'Failed to remove reaction');
     }
   }
 
@@ -204,11 +267,10 @@ export class SlackChannel implements Channel {
     await this.app.stop();
   }
 
-  // Slack does not expose a typing indicator API for bots.
-  // This no-op satisfies the Channel interface so the orchestrator
-  // doesn't need channel-specific branching.
+  // Slack does not expose a native typing indicator API for bots.
+  // Progress feedback is handled via sendMessage/updateMessage in processGroupMessages.
   async setTyping(_jid: string, _isTyping: boolean): Promise<void> {
-    // no-op: Slack Bot API has no typing indicator endpoint
+    // no-op: progress indicator managed externally via sendMessage + updateMessage
   }
 
   /**
@@ -245,9 +307,7 @@ export class SlackChannel implements Channel {
     }
   }
 
-  private async resolveUserName(
-    userId: string,
-  ): Promise<string | undefined> {
+  private async resolveUserName(userId: string): Promise<string | undefined> {
     if (!userId) return undefined;
 
     const cached = this.userNameCache.get(userId);

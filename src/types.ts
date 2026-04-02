@@ -83,12 +83,17 @@ export interface TaskRunLog {
 export interface Channel {
   name: string;
   connect(): Promise<void>;
-  sendMessage(jid: string, text: string): Promise<void>;
+  sendMessage(jid: string, text: string, msgId?: string): Promise<void>;
   isConnected(): boolean;
   ownsJid(jid: string): boolean;
   disconnect(): Promise<void>;
   // Optional: typing indicator. Channels that support it implement it.
   setTyping?(jid: string, isTyping: boolean): Promise<void>;
+  // Optional: update a previously sent message by its msgId.
+  updateMessage?(jid: string, msgId: string, text: string): Promise<void>;
+  // Optional: emoji reactions.
+  addReaction?(jid: string, messageTs: string, emoji: string): Promise<void>;
+  removeReaction?(jid: string, messageTs: string, emoji: string): Promise<void>;
   // Optional: sync group/chat names from the platform.
   syncGroups?(force: boolean): Promise<void>;
 }
